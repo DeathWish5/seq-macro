@@ -118,12 +118,58 @@ struct Value {
     span: Span,
 }
 
+#[derive(Clone, Copy)]
 struct Splice<'a> {
     int: u64,
     kind: Kind,
     suffix: &'a str,
     width: usize,
     radix: Radix,
+}
+
+impl Splice<'_> {
+    fn apply(&self, association: &Association) -> Self {
+        let mut ret = *self;
+        match association {
+            Association::Plus(ref plus) => ret.int += plus,
+            Association::Minus(ref minus) => ret.int -= minus,
+        }
+        ret
+    }
+}
+
+#[derive(Debug)]
+enum Association {
+    Plus(u64),
+    Minus(u64),
+}
+
+#[derive(Debug)]
+struct Associated(Option<(Ident, Association)>);
+
+impl Associated {
+    fn valid(&self) -> bool {
+        self.0.is_some()
+    }
+
+    fn ident(&self) -> &Ident {
+        assert!(self.valid());
+        &self.0.as_ref().unwrap().0
+    }
+
+    fn association(&self) -> &Association {
+        assert!(self.valid());
+        &self.0.as_ref().unwrap().1
+    }
+
+    fn matches(&self, ident: &Ident) -> bool {
+        self.valid() && ident.to_string() == self.ident().to_string()
+    }
+
+    fn apply<'a>(&self, splice: &Splice<'a>) -> Splice<'a> {
+        assert!(self.valid());
+        splice.apply(self.association())
+    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -177,50 +223,87 @@ impl<'a> IntoIterator for &'a Range {
 }
 
 fn seq_impl(input: TokenStream) -> Result<TokenStream, SyntaxError> {
-    let mut iter = input.into_iter();
-    let var = require_ident(&mut iter)?;
-    require_keyword(&mut iter, "in")?;
+    let mut iter = input.into_iter().peekable();
+    let var0 = require_ident(&mut iter)?;
+    require_exact_keyword(&mut iter, "in")?;
     let begin = require_value(&mut iter)?;
-    require_punct(&mut iter, '.')?;
-    require_punct(&mut iter, '.')?;
+    require_exact_punct(&mut iter, '.')?;
+    require_exact_punct(&mut iter, '.')?;
     let inclusive = require_if_punct(&mut iter, '=')?;
     let end = require_value(&mut iter)?;
+    let associated_var = require_exact_punct(&mut iter, ',').is_ok();
+    let var1 = if associated_var {
+        let var1 = require_ident(&mut iter)?;
+        require_exact_punct(&mut iter, '=')?;
+        require_exact_ident(&mut iter, &var0)?;
+        match require_punct(&mut iter)? {
+            '+' => {
+                let plus = require_value(&mut iter)?;
+                Associated(Some((var1, Association::Plus(plus.int))))
+            }
+            '-' => {
+                let minus = require_value(&mut iter)?;
+                Associated(Some((var1, Association::Minus(minus.int))))
+            }
+            ass => {
+                unimplemented!("association {} not supported", ass);
+            }
+        }
+    } else {
+        Associated(None)
+    };
     let body = require_braces(&mut iter)?;
     require_end(&mut iter)?;
 
     let range = validate_range(begin, end, inclusive)?;
 
     let mut found_repetition = false;
-    let expanded = expand_repetitions(&var, &range, body.clone(), &mut found_repetition);
+    let expanded = expand_repetitions(&var0, &range, &var1, body.clone(), &mut found_repetition);
     if found_repetition {
         Ok(expanded)
     } else {
         // If no `#(...)*`, repeat the entire body.
-        Ok(repeat(&var, &range, &body))
+        Ok(repeat(&var0, &var1, &range, &body))
     }
 }
 
-fn repeat(var: &Ident, range: &Range, body: &TokenStream) -> TokenStream {
+fn repeat(var: &Ident, var1: &Associated, range: &Range, body: &TokenStream) -> TokenStream {
     let mut repeated = TokenStream::new();
     for value in range {
-        repeated.extend(substitute_value(var, &value, body.clone()));
+        repeated.extend(substitute_value(var, var1, &value, body.clone()));
     }
     repeated
 }
 
-fn substitute_value(var: &Ident, splice: &Splice, body: TokenStream) -> TokenStream {
+fn substitute_value(
+    var: &Ident,
+    var1: &Associated,
+    splice: &Splice,
+    body: TokenStream,
+) -> TokenStream {
     let mut tokens = Vec::from_iter(body);
-
     let mut i = 0;
     while i < tokens.len() {
         // Substitute our variable by itself, e.g. `N`.
-        let replace = match &tokens[i] {
-            TokenTree::Ident(ident) => ident.to_string() == var.to_string(),
-            _ => false,
+        let (replace, is_associated) = match &tokens[i] {
+            TokenTree::Ident(ident) => {
+                if ident.to_string() == var.to_string() {
+                    (true, false)
+                } else if var1.matches(ident) {
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            _ => (false, false),
         };
         if replace {
             let original_span = tokens[i].span();
-            let mut literal = splice.literal();
+            let mut literal = if is_associated {
+                var1.apply(splice).literal()
+            } else {
+                splice.literal()
+            };
             literal.set_span(original_span);
             tokens[i] = TokenTree::Literal(literal);
             i += 1;
@@ -231,14 +314,18 @@ fn substitute_value(var: &Ident, splice: &Splice, body: TokenStream) -> TokenStr
         if i + 3 <= tokens.len() {
             let prefix = match &tokens[i..i + 3] {
                 [first, TokenTree::Punct(tilde), TokenTree::Ident(ident)]
-                    if tilde.as_char() == '~' && ident.to_string() == var.to_string() =>
+                    if tilde.as_char() == '~' && (ident.to_string() == var.to_string())
+                        || var1.matches(ident) =>
                 {
+                    let is_associated = var1.matches(ident);
                     match first {
-                        TokenTree::Ident(ident) => Some(ident.clone()),
+                        TokenTree::Ident(ident) => Some((ident.clone(), is_associated)),
                         TokenTree::Group(group) => {
                             let mut iter = group.stream().into_iter().fuse();
                             match (iter.next(), iter.next()) {
-                                (Some(TokenTree::Ident(ident)), None) => Some(ident),
+                                (Some(TokenTree::Ident(ident)), None) => {
+                                    Some((ident, is_associated))
+                                }
                                 _ => None,
                             }
                         }
@@ -247,7 +334,12 @@ fn substitute_value(var: &Ident, splice: &Splice, body: TokenStream) -> TokenStr
                 }
                 _ => None,
             };
-            if let Some(prefix) = prefix {
+            if let Some((prefix, is_associated)) = prefix {
+                let splice = if is_associated {
+                    var1.apply(splice)
+                } else {
+                    *splice
+                };
                 let number = match splice.kind {
                     Kind::Int => match splice.radix {
                         Radix::Binary => format!("{0:01$b}", splice.int, splice.width),
@@ -271,7 +363,7 @@ fn substitute_value(var: &Ident, splice: &Splice, body: TokenStream) -> TokenStr
         // Recursively substitute content nested in a group.
         if let TokenTree::Group(group) = &mut tokens[i] {
             let original_span = group.span();
-            let content = substitute_value(var, splice, group.stream());
+            let content = substitute_value(var, var1, splice, group.stream());
             *group = Group::new(group.delimiter(), content);
             group.set_span(original_span);
         }
@@ -303,6 +395,7 @@ fn enter_repetition(tokens: &[TokenTree]) -> Option<TokenStream> {
 fn expand_repetitions(
     var: &Ident,
     range: &Range,
+    var1: &Associated,
     body: TokenStream,
     found_repetition: &mut bool,
 ) -> TokenStream {
@@ -312,7 +405,7 @@ fn expand_repetitions(
     let mut i = 0;
     while i < tokens.len() {
         if let TokenTree::Group(group) = &mut tokens[i] {
-            let content = expand_repetitions(var, range, group.stream(), found_repetition);
+            let content = expand_repetitions(var, range, var1, group.stream(), found_repetition);
             let original_span = group.span();
             *group = Group::new(group.delimiter(), content);
             group.set_span(original_span);
@@ -333,7 +426,7 @@ fn expand_repetitions(
         *found_repetition = true;
         let mut repeated = Vec::new();
         for value in range {
-            repeated.extend(substitute_value(var, &value, template.clone()));
+            repeated.extend(substitute_value(var, var1, &value, template.clone()));
         }
         let repeated_len = repeated.len();
         tokens.splice(i..i + 3, repeated);

@@ -286,3 +286,49 @@ fn test_nested() {
 
     assert_eq!(vec, ["T1", "T1 T2", "T1 T2 T3"]);
 }
+
+#[test]
+fn test_associated() {
+    let mut vec = Vec::new();
+
+    seq!(I in 1..=3, J = I + 1 {
+        vec.push(stringify!(T~I));
+        vec.push(stringify!(K~J));
+    });
+
+    seq!(I in 2..=4, J = I - 1 {
+        vec.push(stringify!(T~I));
+        vec.push(stringify!(K~J));
+    });
+
+    assert_eq!(
+        vec,
+        ["T1", "K2", "T2", "K3", "T3", "K4", "T2", "K1", "T3", "K2", "T4", "K3"]
+    );
+}
+
+#[test]
+fn test_associated_function() {
+    macro_rules! make_func {
+        ($func1:ident, $func2:ident) => {
+            #[inline(always)]
+            pub fn $func1(vec: &mut Vec<u8>) {
+                for _ in 0..2 {
+                    $func2(vec);
+                }
+            }
+        };
+    }
+
+    fn foo0(vec: &mut Vec<u8>) {
+        vec.push(0);
+    }
+
+    seq!(I in 1..=10, J = I - 1 {
+        make_func!(foo~I, foo~J);
+    });
+
+    let mut vec = Vec::new();
+    foo10(&mut vec);
+    assert_eq!(vec.len(), 1024);
+}

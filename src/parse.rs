@@ -4,7 +4,7 @@ use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenSt
 use std::borrow::Borrow;
 use std::cmp;
 use std::fmt::Display;
-use std::iter::FromIterator;
+use std::iter::{FromIterator, Peekable};
 
 pub(crate) struct SyntaxError {
     message: String,
@@ -36,8 +36,15 @@ impl SyntaxError {
     }
 }
 
-fn next_token(iter: &mut TokenIter) -> Result<TokenTree, SyntaxError> {
+fn next_token(iter: &mut Peekable<TokenIter>) -> Result<TokenTree, SyntaxError> {
     iter.next().ok_or_else(|| SyntaxError {
+        message: "unexpected end of input".to_owned(),
+        span: Span::call_site(),
+    })
+}
+
+fn peek_next_token(iter: &mut Peekable<TokenIter>) -> Result<&TokenTree, SyntaxError> {
+    iter.peek().ok_or_else(|| SyntaxError {
         message: "unexpected end of input".to_owned(),
         span: Span::call_site(),
     })
@@ -50,14 +57,33 @@ fn syntax<T: Borrow<TokenTree>, M: Display>(token: T, message: M) -> SyntaxError
     }
 }
 
-pub(crate) fn require_ident(iter: &mut TokenIter) -> Result<Ident, SyntaxError> {
+pub(crate) fn require_exact_ident(
+    iter: &mut Peekable<TokenIter>,
+    exact: &Ident,
+) -> Result<Ident, SyntaxError> {
+    match next_token(iter)? {
+        ref token @ TokenTree::Ident(ref ident) => {
+            if ident.to_string() == exact.to_string() {
+                Ok(ident.clone())
+            } else {
+                Err(syntax(token, format!("expected exact ident {}", exact)))
+            }
+        }
+        other => Err(syntax(other, "expected ident")),
+    }
+}
+
+pub(crate) fn require_ident(iter: &mut Peekable<TokenIter>) -> Result<Ident, SyntaxError> {
     match next_token(iter)? {
         TokenTree::Ident(ident) => Ok(ident),
         other => Err(syntax(other, "expected ident")),
     }
 }
 
-pub(crate) fn require_keyword(iter: &mut TokenIter, keyword: &str) -> Result<(), SyntaxError> {
+pub(crate) fn require_exact_keyword(
+    iter: &mut Peekable<TokenIter>,
+    keyword: &str,
+) -> Result<(), SyntaxError> {
     let token = next_token(iter)?;
     if let TokenTree::Ident(ident) = &token {
         if ident.to_string() == keyword {
@@ -67,7 +93,7 @@ pub(crate) fn require_keyword(iter: &mut TokenIter, keyword: &str) -> Result<(),
     Err(syntax(token, format!("expected `{}`", keyword)))
 }
 
-pub(crate) fn require_value(iter: &mut TokenIter) -> Result<Value, SyntaxError> {
+pub(crate) fn require_value(iter: &mut Peekable<TokenIter>) -> Result<Value, SyntaxError> {
     let mut token = next_token(iter)?;
 
     loop {
@@ -101,10 +127,13 @@ pub(crate) fn require_value(iter: &mut TokenIter) -> Result<Value, SyntaxError> 
     Err(syntax(token, "expected integer"))
 }
 
-pub(crate) fn require_if_punct(iter: &mut TokenIter, ch: char) -> Result<bool, SyntaxError> {
+pub(crate) fn require_if_punct(
+    iter: &mut Peekable<TokenIter>,
+    ch: char,
+) -> Result<bool, SyntaxError> {
     let present = match iter.clone().next() {
         Some(TokenTree::Punct(_)) => {
-            require_punct(iter, ch)?;
+            require_exact_punct(iter, ch)?;
             true
         }
         _ => false,
@@ -112,17 +141,29 @@ pub(crate) fn require_if_punct(iter: &mut TokenIter, ch: char) -> Result<bool, S
     Ok(present)
 }
 
-pub(crate) fn require_punct(iter: &mut TokenIter, ch: char) -> Result<(), SyntaxError> {
+pub(crate) fn require_punct(iter: &mut Peekable<TokenIter>) -> Result<char, SyntaxError> {
     let token = next_token(iter)?;
     if let TokenTree::Punct(punct) = &token {
+        return Ok(punct.as_char());
+    }
+    Err(syntax(token, "expected punct"))
+}
+
+pub(crate) fn require_exact_punct(
+    iter: &mut Peekable<TokenIter>,
+    ch: char,
+) -> Result<(), SyntaxError> {
+    let token = peek_next_token(iter)?;
+    if let TokenTree::Punct(punct) = &token {
         if punct.as_char() == ch {
+            next_token(iter)?;
             return Ok(());
         }
     }
     Err(syntax(token, format!("expected `{}`", ch)))
 }
 
-pub(crate) fn require_braces(iter: &mut TokenIter) -> Result<TokenStream, SyntaxError> {
+pub(crate) fn require_braces(iter: &mut Peekable<TokenIter>) -> Result<TokenStream, SyntaxError> {
     let token = next_token(iter)?;
     if let TokenTree::Group(group) = &token {
         if group.delimiter() == Delimiter::Brace {
@@ -132,7 +173,7 @@ pub(crate) fn require_braces(iter: &mut TokenIter) -> Result<TokenStream, Syntax
     Err(syntax(token, "expected curly braces"))
 }
 
-pub(crate) fn require_end(iter: &mut TokenIter) -> Result<(), SyntaxError> {
+pub(crate) fn require_end(iter: &mut Peekable<TokenIter>) -> Result<(), SyntaxError> {
     match iter.next() {
         Some(token) => Err(syntax(token, "unexpected token")),
         None => Ok(()),
